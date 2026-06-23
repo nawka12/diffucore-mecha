@@ -1,0 +1,5 @@
+# sd-mecha brings its own deps (torch is already provided by Diffucore UI).
+# Left unpinned on purpose: this extension introspects sd-mecha at runtime, so a
+# newer sd-mecha — with merge methods that didn't exist when this was written —
+# keeps working without any change here.
+sd-mecha

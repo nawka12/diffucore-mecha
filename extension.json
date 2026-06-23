@@ -1,0 +1,11 @@
+{
+  "name": "diffucore-mecha",
+  "title": "Mecha Merge",
+  "version": "0.1.0",
+  "author": "nawka12",
+  "description": "Merge model checkpoints with sd-mecha. The merge-method list is built from sd-mecha at runtime, so new methods appear without updating this extension.",
+  "entry": "extension.py",
+  "web": "web",
+  "min_ui_version": "0.1.0",
+  "default_enabled": true
+}
