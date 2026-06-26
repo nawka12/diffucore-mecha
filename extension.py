@@ -281,6 +281,234 @@ def _run_merge(job, *, api, method_id, input_paths, raw_params,
     return {"info": f"merged → {out_name}", "output": out_name, "ext": NAME}
 
 
+# ── LoRA / LoHa / LoKr baking (self-contained — no sd-mecha needed) ───────────
+# Bakes one or more low-rank adapters into a base model:
+#     merged = base + Σ strengthᵢ · deltaᵢ
+# the same delta-reconstruction idea as the reference AnimaPulse LoKr baker,
+# generalised to LoRA / LoHa / LoKr and to both key conventions in the wild:
+#   • kohya / LyCORIS — underscore-flattened, e.g. lora_unet_blocks_0_attn_q_proj
+#   • PEFT / diffusers — dot-path,            e.g. diffusion_model.blocks.0.…lora_A
+# sd-mecha's own LoRA converters only know SD1/SDXL/SD3/Flux, so they can't bake
+# into other architectures (Cosmos/Anima, …); this path is architecture-agnostic
+# because it matches adapter→base layers by their flattened module path.
+
+# Network-name prefixes an adapter key may carry, longest first so the most
+# specific wins (lora_te1_ before lora_).
+_ADAPTER_PREFIXES = (
+    "lora_unet_", "lora_te1_", "lora_te2_", "lora_te_", "lora_transformer_",
+    "lycoris_unet_", "lycoris_", "lora_",
+    "model.diffusion_model.", "diffusion_model.", "transformer.", "unet.",
+)
+# Architecture prefixes a base weight key may carry, longest first.
+_BASE_PREFIXES = (
+    "model.diffusion_model.", "diffusion_model.", "cond_stage_model.",
+    "conditioner.", "first_stage_model.", "transformer.", "net.", "model.",
+)
+# Trailing factor names that mark an adapter layer; stripping one yields the
+# layer's module prefix.
+_ALGO_SUFFIXES = (
+    ".lokr_w1_a", ".lokr_w1", ".lokr_w2_a", ".lokr_w2", ".lokr_t2",
+    ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b", ".hada_t1", ".hada_t2",
+    ".lora_down.weight", ".lora_up.weight", ".lora_mid.weight",
+    ".lora_A.weight", ".lora_B.weight", ".diff", ".diff_b",
+    ".alpha", ".dora_scale",
+)
+
+
+def _strip_prefix(s: str, prefixes) -> str:
+    for p in prefixes:
+        if s.startswith(p):
+            return s[len(p):]
+    return s
+
+
+def _adapter_tail(prefix: str) -> str:
+    """Normalised module path of an adapter layer: drop the network-name prefix,
+    flatten separators so kohya ``_`` and PEFT ``.`` paths land on one form."""
+    return _strip_prefix(prefix, _ADAPTER_PREFIXES).replace(".", "_")
+
+
+def _base_tail(key: str) -> str | None:
+    """Same normalised module path for a base *weight* key, or ``None`` if the key
+    isn't a weight we can bake into."""
+    if not key.endswith(".weight"):
+        return None
+    return _strip_prefix(key[:-len(".weight")], _BASE_PREFIXES).replace(".", "_")
+
+
+def _module_prefix(key: str) -> str | None:
+    for suf in _ALGO_SUFFIXES:
+        if key.endswith(suf):
+            return key[:-len(suf)]
+    return None
+
+
+def _scale(alpha, dim) -> float:
+    """LoRA-style scale α/dim, with α stored as a 0-dim tensor. Falls back to 1.0
+    when there's no alpha or no rank (e.g. a raw ``diff`` weight)."""
+    if alpha is None or dim is None:
+        return 1.0
+    a = float(alpha.float().item())
+    if a != a or a in (float("inf"), float("-inf")):  # nan/inf guard
+        return 1.0
+    return a / dim
+
+
+def _lokr_delta(get, target_shape):
+    import torch
+    w1, w1_a, w1_b = get("lokr_w1"), get("lokr_w1_a"), get("lokr_w1_b")
+    dim = None
+    if w1 is not None:
+        W1 = w1.float()
+    elif w1_a is not None and w1_b is not None:
+        W1 = w1_a.float() @ w1_b.float()
+        dim = w1_b.shape[0]
+    else:
+        raise KeyError("no lokr w1 factors")
+
+    w2, w2_a, w2_b, t2 = get("lokr_w2"), get("lokr_w2_a"), get("lokr_w2_b"), get("lokr_t2")
+    if t2 is not None and w2_a is not None and w2_b is not None:
+        W2 = torch.einsum("i j ..., i p, j r -> p r ...", t2.float(), w2_a.float(), w2_b.float())
+        dim = dim if dim is not None else w2_b.shape[0]
+    elif w2_a is not None and w2_b is not None:
+        W2 = w2_a.float() @ w2_b.float().flatten(1)
+        dim = dim if dim is not None else w2_b.shape[0]
+    elif w2 is not None:
+        W2 = w2.float()
+    else:
+        raise KeyError("no lokr w2 factors")
+
+    scale = _scale(get("alpha"), dim)
+    while W1.dim() < W2.dim():
+        W1 = W1.unsqueeze(-1)
+    return (torch.kron(W1, W2) * scale).reshape(target_shape)
+
+
+def _loha_delta(get, target_shape):
+    import torch
+    w1a, w1b = get("hada_w1_a"), get("hada_w1_b")
+    w2a, w2b = get("hada_w2_a"), get("hada_w2_b")
+    if any(x is None for x in (w1a, w1b, w2a, w2b)):
+        raise KeyError("incomplete loha factors")
+    t1, t2 = get("hada_t1"), get("hada_t2")
+    if t1 is not None and t2 is not None:
+        m1 = torch.einsum("i j ..., i p, j r -> p r ...", t1.float(), w1a.float(), w1b.float())
+        m2 = torch.einsum("i j ..., i p, j r -> p r ...", t2.float(), w2a.float(), w2b.float())
+    else:
+        m1 = w1a.float() @ w1b.float().flatten(1)
+        m2 = w2a.float() @ w2b.float().flatten(1)
+    scale = _scale(get("alpha"), w1b.shape[0])
+    return (m1 * m2 * scale).reshape(target_shape)
+
+
+def _lora_delta(get, target_shape):
+    up, down = get("lora_up.weight"), get("lora_down.weight")
+    if up is None and down is None:  # PEFT/diffusers naming
+        up, down = get("lora_B.weight"), get("lora_A.weight")
+    if up is None or down is None:
+        raise KeyError("no lora up/down factors")
+    if get("lora_mid.weight") is not None:
+        raise KeyError("CP-decomposed LoRA (lora_mid) not supported")
+    up, down = up.float(), down.float()
+    delta = up.reshape(up.shape[0], -1) @ down.reshape(down.shape[0], -1)
+    return (delta * _scale(get("alpha"), down.shape[0])).reshape(target_shape)
+
+
+def _adapter_delta(tensors: dict, prefix: str, target_shape):
+    """Reconstruct one layer's float32 weight delta from its adapter factors,
+    auto-detecting the algorithm. Raises ``KeyError`` for layers we can't (or
+    won't) reconstruct — the caller skips those rather than aborting the bake."""
+    def get(suffix):
+        return tensors.get(f"{prefix}.{suffix}")
+
+    if get("lokr_w1") is not None or get("lokr_w1_a") is not None:
+        return _lokr_delta(get, target_shape)
+    if get("hada_w1_a") is not None:
+        return _loha_delta(get, target_shape)
+    if get("diff") is not None:
+        return get("diff").float().reshape(target_shape)
+    if any(get(s) is not None for s in
+           ("lora_up.weight", "lora_down.weight", "lora_A.weight", "lora_B.weight")):
+        return _lora_delta(get, target_shape)
+    raise KeyError("unrecognised adapter layer")
+
+
+def _load_adapter(path: str, device: str):
+    """Read an adapter file and index its layers by normalised module path
+    (tail → module prefix) so base weights can be matched in one pass."""
+    from safetensors import safe_open
+    tensors: dict = {}
+    with safe_open(path, framework="pt", device=device) as f:
+        for k in f.keys():
+            tensors[k] = f.get_tensor(k)
+    index: dict[str, str] = {}
+    for k in tensors:
+        mp = _module_prefix(k)
+        if mp is not None:
+            index[_adapter_tail(mp)] = mp
+    return tensors, index
+
+
+def _run_lora_merge(job, *, api, base_path, adapters, out_path, out_name, device, dtype):
+    """Bake the adapters into the base, streaming the base one weight at a time so
+    a multi-GB model never has to be held twice. Runs on the shared job worker."""
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    out_dtype = getattr(torch, _DTYPES[dtype])
+
+    loaded = []
+    for ad in adapters:
+        tensors, index = _load_adapter(str(ad["path"]), device)
+        loaded.append({"name": ad["name"], "strength": float(ad["strength"]),
+                       "tensors": tensors, "index": index, "layers": len(index),
+                       "applied": 0})
+
+    with safe_open(str(base_path), framework="pt", device=device) as f:
+        base_keys = list(f.keys())
+        base_meta = f.metadata() or {}
+
+    api.broadcast({"type": f"ext:{NAME}", "status": "running", "output": out_name})
+
+    tq = _job_tqdm(job, api)(total=len(base_keys), desc="bake")
+    merged: dict = {}
+    skipped: list[str] = []
+
+    with safe_open(str(base_path), framework="pt", device=device) as f:
+        for key in base_keys:
+            tensor = f.get_tensor(key)
+            tail = _base_tail(key)
+            acc = None
+            if tail is not None:
+                for L in loaded:
+                    prefix = L["index"].get(tail)
+                    if prefix is None:
+                        continue
+                    try:
+                        delta = _adapter_delta(L["tensors"], prefix, tensor.shape)
+                    except (KeyError, RuntimeError, ValueError) as e:
+                        if len(skipped) < 20:
+                            skipped.append(f"{L['name']}:{prefix} ({e})")
+                        continue
+                    if acc is None:
+                        acc = tensor.float()
+                    acc = acc + L["strength"] * delta
+                    L["applied"] += 1
+            merged[key] = (acc if acc is not None else tensor.float()).to(out_dtype).cpu()
+            tq.update(1)
+    tq.close()
+
+    save_file(merged, str(out_path), metadata=base_meta)
+
+    parts = [f"{L['name']} {L['applied']}/{L['layers']}" for L in loaded]
+    info = f"baked → {out_name}  [{'; '.join(parts)}]"
+    if skipped:
+        info += f"  ({len(skipped)} layer(s) skipped)"
+    api.broadcast({"type": f"ext:{NAME}", "status": "done", "output": out_name})
+    return {"info": info, "output": out_name, "ext": NAME, "skipped": skipped}
+
+
 # ── request models ───────────────────────────────────────────────────────────
 
 class MergeRequest(BaseModel):
@@ -288,6 +516,20 @@ class MergeRequest(BaseModel):
     folder: str = "checkpoints"
     models: list[str] = []
     params: dict = {}
+    output: str = ""
+    device: str = "cpu"
+    dtype: str = "fp16"
+
+
+class LoraSpec(BaseModel):
+    name: str
+    strength: float = 1.0
+
+
+class LoraMergeRequest(BaseModel):
+    folder: str = "checkpoints"
+    base: str = ""
+    loras: list[LoraSpec] = []
     output: str = ""
     device: str = "cpu"
     dtype: str = "fp16"
@@ -396,6 +638,36 @@ def setup(api):
             )
 
         job_id = api.enqueue_job(f"mecha merge → {out_name}", run, kind="merge")
+        return {"job": job_id, "output": out_name}
+
+    def _loras_dir():
+        return (api.root_dir / "models" / "loras").resolve()
+
+    @router.post("/lora/merge")
+    def lora_merge(req: LoraMergeRequest):
+        d = _models_dir(req.folder)
+        base_path = _resolve_input(d, req.base)
+
+        ld = _loras_dir()
+        specs = [s for s in req.loras if s.name]
+        if not specs:
+            raise HTTPException(400, "select at least one LoRA")
+        adapters = [
+            {"name": s.name, "path": _resolve_input(ld, s.name), "strength": s.strength}
+            for s in specs
+        ]
+
+        out_path, out_name = _resolve_output(d, req.output)
+        device = req.device if req.device in ("cpu", "cuda") else "cpu"
+        dtype = req.dtype if req.dtype in _DTYPES else "fp16"
+
+        def run(job):
+            return _run_lora_merge(
+                job, api=api, base_path=base_path, adapters=adapters,
+                out_path=out_path, out_name=out_name, device=device, dtype=dtype,
+            )
+
+        job_id = api.enqueue_job(f"lora bake → {out_name}", run, kind="merge")
         return {"job": job_id, "output": out_name}
 
     api.add_api_router(router)

@@ -69,6 +69,34 @@ instructions until it's present.
    uses VRAM and may contend with a loaded model) and **dtype**.
 6. **Merge.** Progress shows in the tab and the shared queue panel.
 
+## LoRA Merge (bake adapters into a model)
+
+A second **LoRA Merge** tab bakes one or more low-rank adapters into a base model:
+
+```
+merged = base + Σ strengthᵢ · deltaᵢ
+```
+
+1. Pick the **folder** (where the base lives and the output lands) and the **base**
+   model.
+2. Add one or more **adapters** from `models/loras`, each with its own **strength**
+   (1.0 = full).
+3. Name the **output**, pick **device** / **dtype**, and **Bake**. Progress shows in
+   the tab and the shared queue; the status line reports how many layers each
+   adapter matched.
+
+Supported adapter algorithms: **LoRA**, **LoHa**, and **LoKr** (incl. the
+factored `…_a`/`…_b` and Tucker `t1`/`t2` forms), plus raw `diff` weights. Both
+key conventions in the wild are handled — kohya/LyCORIS (`lora_unet_…`) and
+PEFT/diffusers (`diffusion_model.…lora_A`) — by matching adapter layers to base
+weights on their flattened module path. Layers that can't be reconstructed (e.g.
+CP-decomposed `lora_mid`) are skipped and counted, never miscomputed.
+
+Unlike the sd-mecha **Merge** tab, this path is **self-contained** (pure
+torch/safetensors) and **architecture-agnostic**, so it works for models sd-mecha
+has no config for (e.g. Cosmos/Anima DiT). It also works even when sd-mecha isn't
+installed.
+
 ## Limitations
 
 - **Flat, single-step merges.** Some methods expect a *delta*-space input (e.g.

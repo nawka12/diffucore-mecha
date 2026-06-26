@@ -10,7 +10,7 @@
   const API = `/api/ext/${NAME}`;
 
   let METHODS = {};                 // id -> spec {models, varargs, params, doc}
-  let FILES = { 'checkpoints': [], 'diffusion-models': [] };
+  let FILES = { 'checkpoints': [], 'diffusion-models': [], 'loras': [] };
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -31,7 +31,7 @@
     try {
       const r = await fetch('/api/models');
       const d = await r.json();
-      FILES = { 'checkpoints': d.checkpoints || [], 'diffusion-models': d.dits || [] };
+      FILES = { 'checkpoints': d.checkpoints || [], 'diffusion-models': d.dits || [], 'loras': d.loras || [] };
     } catch (e) { /* leave empties; selects just show no options */ }
   }
 
@@ -257,6 +257,159 @@
 
     unmount(el) {
       if (el._mechaEs) { try { el._mechaEs.close(); } catch (_) {} el._mechaEs = null; }
+    },
+  });
+
+  // ── LoRA Merge tab ────────────────────────────────────────────────────────
+  // Bakes one or more low-rank adapters (LoRA / LoHa / LoKr) into a base model.
+  // Self-contained on the backend (no sd-mecha needed), so this tab works even
+  // when the sd-mecha "Merge" tab above reports it isn't installed.
+  window.DiffucoreExt.registerTab({
+    id: `${NAME}-lora`,
+    title: 'LoRA Merge',
+    mount(el) {
+      el.innerHTML = `
+        <div style="max-width:720px">
+          <h2 style="font-family:var(--serif);font-weight:400;margin:0 0 4px">LoRA <em style="color:var(--accent)">bake</em></h2>
+          <p class="hint" style="margin:0 0 14px">Bake LoRA / LoHa / LoKr adapters into a base model:
+            <code>merged = base + Σ&nbsp;strength·delta</code>. Works across kohya and PEFT key conventions.</p>
+
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 10px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-2)">folder
+              <select id="lb-folder">
+                <option value="checkpoints">checkpoints</option>
+                <option value="diffusion-models">diffusion-models</option>
+              </select>
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-2)">base
+              <select id="lb-base" style="min-width:240px"></select>
+            </label>
+          </div>
+
+          <div style="font-size:12px;color:var(--txt-3);margin:0 0 4px">adapters</div>
+          <div id="lb-loras" style="margin:0 0 6px"></div>
+          <button type="button" class="btn small" id="lb-add">+ add LoRA</button>
+
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:14px 0 10px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-2)">output
+              <input id="lb-output" type="text" placeholder="baked-model" style="width:200px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-2)">device
+              <select id="lb-device"><option value="cpu">cpu</option><option value="cuda">cuda</option></select>
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt-2)">dtype
+              <select id="lb-dtype"><option value="fp16">fp16</option><option value="fp32">fp32</option><option value="bf16">bf16</option></select>
+            </label>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:12px">
+            <button class="btn primary" id="lb-go">Bake</button>
+            <span id="lb-status" class="hint"></span>
+          </div>
+          <div style="height:4px;background:var(--surface-2);border-radius:2px;margin-top:10px;overflow:hidden">
+            <div id="lb-bar" style="height:100%;width:0;background:var(--accent);transition:width .2s"></div>
+          </div>
+        </div>`;
+
+      let myJobId = null;
+      const $ = (s) => el.querySelector(s);
+
+      const es = new EventSource('/api/events');
+      el._lbEs = es;
+      es.onmessage = (e) => {
+        let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
+        if (ev.job == null || ev.job !== myJobId) return;
+        const st = $('#lb-status'); const bar = $('#lb-bar');
+        if (ev.type === 'progress' && bar) {
+          bar.style.width = ev.total ? `${Math.round((ev.step / ev.total) * 100)}%` : '0%';
+          if (st) st.textContent = `baking… ${ev.step}/${ev.total}`;
+        } else if (ev.type === 'done') {
+          if (st) st.textContent = ev.info || `done — saved ${ev.output || ''}`;
+          if (bar) bar.style.width = '100%';
+          myJobId = null; setBusy(false);
+          loadFiles().then(fillBase);
+        } else if (ev.type === 'error' || ev.type === 'cancelled') {
+          if (st) st.textContent = ev.type === 'cancelled' ? 'cancelled' : `error: ${ev.message || 'bake failed'}`;
+          myJobId = null; setBusy(false);
+        }
+      };
+
+      function setBusy(b) {
+        const btn = $('#lb-go');
+        if (btn) { btn.disabled = b; btn.textContent = b ? 'Baking…' : 'Bake'; }
+      }
+
+      function baseOptions() {
+        const list = FILES[$('#lb-folder').value] || [];
+        return ['<option value="">— select —</option>']
+          .concat(list.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`)).join('');
+      }
+      function fillBase() {
+        const sel = $('#lb-base'); if (!sel) return;
+        const cur = sel.value; sel.innerHTML = baseOptions();
+        if (cur && FILES[$('#lb-folder').value].includes(cur)) sel.value = cur;
+      }
+
+      function loraOptions() {
+        return ['<option value="">— select —</option>']
+          .concat((FILES.loras || []).map((f) => `<option value="${esc(f)}">${esc(f)}</option>`)).join('');
+      }
+      function addLoraRow() {
+        const row = document.createElement('div');
+        row.className = 'lb-row';
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:0 0 6px';
+        row.innerHTML =
+          `<select class="lb-lora" style="flex:1">${loraOptions()}</select>` +
+          `<input class="lb-strength" type="number" step="any" value="1.0" title="strength" style="width:70px">` +
+          `<button type="button" class="btn small lb-rm" title="remove">✕</button>`;
+        row.querySelector('.lb-rm').onclick = () => row.remove();
+        $('#lb-loras').appendChild(row);
+      }
+
+      fillBase();
+      addLoraRow();
+      $('#lb-folder').addEventListener('change', fillBase);
+      $('#lb-add').addEventListener('click', addLoraRow);
+
+      $('#lb-go').addEventListener('click', async () => {
+        const st = $('#lb-status');
+        const base = $('#lb-base').value;
+        if (!base) { st.textContent = 'pick a base model'; return; }
+        const loras = Array.from(el.querySelectorAll('.lb-row')).map((r) => ({
+          name: r.querySelector('.lb-lora').value,
+          strength: parseFloat(r.querySelector('.lb-strength').value),
+        })).filter((l) => l.name && !Number.isNaN(l.strength));
+        if (!loras.length) { st.textContent = 'select at least one LoRA'; return; }
+        const output = $('#lb-output').value.trim();
+        if (!output) { st.textContent = 'name the output'; return; }
+
+        setBusy(true);
+        $('#lb-bar').style.width = '0%';
+        st.textContent = 'queued…';
+        try {
+          const r = await fetch(`${API}/lora/merge`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              folder: $('#lb-folder').value, base, loras, output,
+              device: $('#lb-device').value, dtype: $('#lb-dtype').value,
+            }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || 'bake failed');
+          myJobId = d.job;
+          st.textContent = 'queued — baking on the shared worker…';
+        } catch (e) {
+          st.textContent = `error: ${e.message || e}`;
+          setBusy(false);
+        }
+      });
+
+      loadFiles().then(() => { fillBase(); el.querySelectorAll('.lb-lora').forEach((s) => { s.innerHTML = loraOptions(); }); });
+    },
+
+    unmount(el) {
+      if (el._lbEs) { try { el._lbEs.close(); } catch (_) {} el._lbEs = null; }
     },
   });
 
