@@ -106,8 +106,24 @@
         slots.innerHTML = '';
         ps.innerHTML = '';
         const spec = METHODS[id];
-        if (!spec) { doc.textContent = ''; return; }
+        const outnote = el.querySelector('#mecha-outnote');
+        const outInput = el.querySelector('#mecha-output');
+        if (!spec) {
+          doc.textContent = '';
+          if (outnote) { outnote.style.display = 'none'; outnote.textContent = ''; }
+          return;
+        }
         doc.textContent = spec.doc || '';
+        // A delta-extraction method (e.g. subtract) produces a difference model, not
+        // a loadable checkpoint — flag it so the output isn't mistaken for a model.
+        const isDelta = spec.output_space === 'delta';
+        if (outnote) {
+          outnote.style.display = isDelta ? '' : 'none';
+          outnote.textContent = isDelta
+            ? 'Δ Produces a difference (delta) model — a building block, not a directly loadable checkpoint.'
+            : '';
+        }
+        if (outInput) outInput.placeholder = isDelta ? 'difference-model' : 'merged-model';
 
         (spec.models || []).forEach((m) => slots.appendChild(modelSelect(m.name, m.space)));
 
@@ -170,6 +186,7 @@
             </label>
           </div>
           <pre class="hint" id="mecha-doc" style="white-space:pre-wrap;min-height:18px;margin:0 0 10px"></pre>
+          <div class="hint" id="mecha-outnote" style="margin:0 0 10px;color:var(--accent);display:none"></div>
 
           <div style="font-size:12px;color:var(--txt-3);margin:0 0 4px">models</div>
           <div id="mecha-models" style="margin:0 0 12px"></div>

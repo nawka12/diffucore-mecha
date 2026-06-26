@@ -83,6 +83,53 @@ def _space_label(ms) -> str:
     return ""
 
 
+def _accepts_weight(ms) -> bool:
+    """True if a model-slot input can bind a ``weight``-space model — i.e. its
+    declared space is a generic symbol that includes ``weight``, a fixed set
+    containing ``weight``, or a single fixed ``weight``."""
+    sub = getattr(ms, "merge_spaces", None)              # a generic merge-space symbol
+    if sub is not None:
+        return any(getattr(s, "identifier", None) == "weight" for s in sub)
+    if isinstance(ms, (set, frozenset)):                 # a fixed set of spaces
+        return any(getattr(s, "identifier", None) == "weight" for s in ms)
+    return getattr(ms, "identifier", None) == "weight"   # a single fixed space
+
+
+def _inputs_accept_weight(m) -> bool:
+    """True if every *model-slot* input of ``m`` can bind a ``weight``-space model.
+    Hyperparameters (``param`` space) are skipped — they're scalar knobs, not slots."""
+    spaces = m.get_input_merge_spaces()
+    slots = [*spaces.args, *spaces.kwargs.values()]
+    if m.get_param_names().has_varargs():
+        slots.append(spaces.vararg)
+    return all(_accepts_weight(ms) for ms in slots if not _is_param_space(ms))
+
+
+def _output_space(m) -> str | None:
+    """The merge space a *standalone* single-method merge of ``m`` would produce,
+    or ``None`` if it can't run standalone from this flat UI's weight model files.
+
+    ``sd_mecha.merge`` pins the final output to one space (``strict_merge_space``),
+    so the return space decides the artifact:
+
+    * ``"weight"`` — a generic return *symbol* (propagates from the inputs) or a
+      fixed ``weight`` return: an ordinary merge producing a model.
+    * ``"delta"`` — a method that consumes weights and fixes its return to ``delta``
+      (e.g. ``subtract``): *delta extraction*, producing a difference model.
+
+    Returns ``None`` for mask builders (fixed ``param`` return) and for methods that
+    fix their return to ``delta`` but need ``delta`` *inputs* (e.g. ``ties_sum``) —
+    neither can run from weight model files alone. The weight/symbol case is left
+    ungated on inputs so it keeps the exact set of ordinary merges shown before.
+    """
+    ident = getattr(m.get_return_type().data.merge_space, "identifier", None)
+    if ident is None or ident == "weight":
+        return "weight"
+    if ident == "delta" and _inputs_accept_weight(m):
+        return "delta"
+    return None
+
+
 def _kind(itype, default=None) -> str:
     """Widget kind for a hyperparameter.
 
@@ -177,14 +224,20 @@ def _param_specs(m):
 
 def _describe(m):
     """Full JSON description of a method, or ``None`` if it isn't a user-facing
-    merge (e.g. a dtype/device getter that returns a non-model)."""
+    merge — e.g. a getter that returns a non-model, or a building block that can't
+    run standalone in this flat UI (a mask, or a delta op needing delta inputs; see
+    :func:`_output_space`)."""
     import inspect
+    out_space = "weight"
     try:
-        ret_iface = m.get_return_type().data.interface
-        if not _is_model_iface(ret_iface):
+        ret = m.get_return_type().data
+        if not _is_model_iface(ret.interface):
+            return None
+        out_space = _output_space(m)
+        if out_space is None:
             return None
     except Exception:
-        pass  # fail-open: if the return type can't be read, keep the method
+        pass  # fail-open: if the return type can't be read, keep it as a plain merge
 
     models, varargs, params = _param_specs(m)
     if not models and not varargs:
@@ -197,7 +250,7 @@ def _describe(m):
         pass
     return {
         "id": m.identifier, "models": models, "varargs": varargs,
-        "params": params, "doc": doc[:800],
+        "params": params, "doc": doc[:800], "output_space": out_space,
     }
 
 
@@ -269,12 +322,21 @@ def _run_merge(job, *, api, method_id, input_paths, raw_params,
     nodes = [sd_mecha.model(str(p)) for p in input_paths]
     recipe = method(*nodes, **kwargs)
 
+    # sd_mecha.merge pins the output to "weight" by default; a delta-extraction
+    # method (e.g. subtract) produces a "delta" instead, so match the merge space
+    # to what the method actually returns or finalization rejects it.
+    try:
+        strict_space = _output_space(method) or "weight"
+    except Exception:
+        strict_space = "weight"
+
     api.broadcast({"type": f"ext:{NAME}", "status": "running", "output": out_name})
     sd_mecha.merge(
         recipe,
         output=str(out_path),
         merge_device=device,
         output_dtype=getattr(torch, _DTYPES[dtype]),
+        strict_merge_space=strict_space,
         tqdm=_job_tqdm(job, api),
     )
     api.broadcast({"type": f"ext:{NAME}", "status": "done", "output": out_name})
